@@ -248,7 +248,7 @@ class TransductiveDataset(InMemoryDataset):
 
     @property
     def raw_file_names(self):
-        return ["train.txt", "valid.txt", "test.txt"]
+        return ["graph.txt", "train.txt", "valid.txt", "test.txt"]
     
     def download(self):
         for url, path in zip(self.urls, self.raw_paths):
@@ -287,13 +287,18 @@ class TransductiveDataset(InMemoryDataset):
     # default loading procedure: process train/valid/test files, create graphs from them
     def process(self):
 
-        train_files = self.raw_paths[:3]
+        train_files = self.raw_paths[:4]
 
-        train_results = self.load_file(train_files[0], inv_entity_vocab={}, inv_rel_vocab={})
-        valid_results = self.load_file(train_files[1], 
-                        train_results["inv_entity_vocab"], train_results["inv_rel_vocab"])
-        test_results = self.load_file(train_files[2],
-                        train_results["inv_entity_vocab"], train_results["inv_rel_vocab"])
+        graph_results = self.load_file(train_files[0], inv_entity_vocab={}, inv_rel_vocab={})
+        
+        train_results = self.load_file(train_files[1], 
+                        graph_results["inv_entity_vocab"], graph_results["inv_rel_vocab"])
+        
+        valid_results = self.load_file(train_files[2], 
+                        graph_results["inv_entity_vocab"], graph_results["inv_rel_vocab"])
+        
+        test_results = self.load_file(train_files[3],
+                        graph_results["inv_entity_vocab"], graph_results["inv_rel_vocab"])
         
         # in some datasets, there are several new nodes in the test set, eg 123,143 YAGO train adn 123,182 in YAGO test
         # for consistency with other experimental results, we'll include those in the full vocab and num nodes
@@ -301,11 +306,18 @@ class TransductiveDataset(InMemoryDataset):
         # the same for rels: in most cases train == test for transductive
         # for AristoV4 train rels 1593, test 1604
         num_relations = test_results["num_relation"]
-
+        
+        graph_triplets = graph_results["triplets"]
         train_triplets = train_results["triplets"]
         valid_triplets = valid_results["triplets"]
         test_triplets = test_results["triplets"]
-
+        
+        graph_target_edges = torch.tensor([[t[0], t[1]] for t in graph_triplets], dtype=torch.long).t()
+        graph_target_etypes = torch.tensor([t[2] for t in graph_triplets])
+        
+        graph_edges = torch.cat([graph_target_edges, graph_target_edges.flip(0)], dim=1)
+        graph_etypes = torch.cat([graph_target_etypes, graph_target_etypes+num_relations])
+        
         train_target_edges = torch.tensor([[t[0], t[1]] for t in train_triplets], dtype=torch.long).t()
         train_target_etypes = torch.tensor([t[2] for t in train_triplets])
 
@@ -315,14 +327,14 @@ class TransductiveDataset(InMemoryDataset):
         test_edges = torch.tensor([[t[0], t[1]] for t in test_triplets], dtype=torch.long).t()
         test_etypes = torch.tensor([t[2] for t in test_triplets])
 
-        train_edges = torch.cat([train_target_edges, train_target_edges.flip(0)], dim=1)
-        train_etypes = torch.cat([train_target_etypes, train_target_etypes+num_relations])
+        # train_edges = torch.cat([train_target_edges, train_target_edges.flip(0)], dim=1)
+        # train_etypes = torch.cat([train_target_etypes, train_target_etypes+num_relations])
 
-        train_data = Data(edge_index=train_edges, edge_type=train_etypes, num_nodes=num_node,
+        train_data = Data(edge_index=graph_edges, edge_type=graph_etypes, num_nodes=num_node,
                           target_edge_index=train_target_edges, target_edge_type=train_target_etypes, num_relations=num_relations*2)
-        valid_data = Data(edge_index=train_edges, edge_type=train_etypes, num_nodes=num_node,
+        valid_data = Data(edge_index=graph_edges, edge_type=graph_etypes, num_nodes=num_node,
                           target_edge_index=valid_edges, target_edge_type=valid_etypes, num_relations=num_relations*2)
-        test_data = Data(edge_index=train_edges, edge_type=train_etypes, num_nodes=num_node,
+        test_data = Data(edge_index=graph_edges, edge_type=graph_etypes, num_nodes=num_node,
                          target_edge_index=test_edges, target_edge_type=test_etypes, num_relations=num_relations*2)
 
         # build graphs of relations
@@ -352,6 +364,19 @@ class TransductiveDataset(InMemoryDataset):
     def processed_file_names(self):
         return "data.pt"
 
+
+class RelBench(TransductiveDataset):
+    name = "relbench"
+    
+    def download(self):
+        #todo: implement downloading from the official repo
+        pass
+    
+class RelBenchF1(RelBench):
+    name = "relbench-f1"
+    
+    def __init__(self, root):
+        super(RelBenchF1, self).__init__(root=root)
 
 
 class CoDEx(TransductiveDataset):
