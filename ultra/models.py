@@ -104,8 +104,8 @@ class RelNBFNet(BaseNBFNet):
 
 class EntityNBFNet(BaseNBFNet):
 
-    def __init__(self, input_dim, hidden_dims, num_relation=1, **kwargs):
-
+    def __init__(self, input_dim, hidden_dims, num_relation=1, mode="classification", **kwargs):
+        
         # dummy num_relation = 1 as we won't use it in the NBFNet layer
         super().__init__(input_dim, hidden_dims, num_relation, **kwargs)
 
@@ -119,6 +119,15 @@ class EntityNBFNet(BaseNBFNet):
             )
 
         feature_dim = (sum(hidden_dims) if self.concat_hidden else hidden_dims[-1]) + input_dim
+        
+        self.classification_mlp = nn.Sequential()
+        classification_mlp = []
+        for i in range(self.num_mlp_layers - 1):
+            classification_mlp.append(nn.Linear(feature_dim, feature_dim))
+            classification_mlp.append(nn.ReLU())
+        classification_mlp.append(nn.Linear(feature_dim, 2 ))
+        self.classification_mlp = nn.Sequential(*classification_mlp)
+        
         self.mlp = nn.Sequential()
         mlp = []
         for i in range(self.num_mlp_layers - 1):
@@ -205,8 +214,11 @@ class EntityNBFNet(BaseNBFNet):
 
         # probability logit for each tail node in the batch
         # (batch_size, num_negative + 1, dim) -> (batch_size, num_negative + 1)
-        score = self.mlp(feature).squeeze(-1)
-        return score.view(shape)
+        
+        score = self.classification_mlp(feature).squeeze(-1)
+        # score = self.mlp(feature).squeeze(-1)
+        # return score.view(shape)
+        return score.view([shape[0],2])
 
 
 class QueryNBFNet(EntityNBFNet):

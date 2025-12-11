@@ -6,6 +6,7 @@ from itertools import islice
 
 import torch
 import torch_geometric as pyg
+from torchmetrics.classification import AUROC
 from torch import optim
 from torch import nn
 from torch.nn import functional as F
@@ -49,7 +50,7 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
     step = math.ceil(cfg.train.num_epoch / 10)
     best_result = float("-inf")
     best_epoch = -1
-
+    
     batch_id = 0
     for i in range(0, cfg.train.num_epoch, step):
         parallel_model.train()
@@ -63,18 +64,24 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
             for batch in islice(train_loader, batch_per_epoch):
                 batch = tasks.negative_sampling(train_data, batch, cfg.task.num_negative,
                                                 strict=cfg.task.strict_negative)
+                
+                # target = torch.zeros_like(pred)
+                # target[:, 0] = 1
+                # loss = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+                # neg_weight = torch.ones_like(pred)
+                # if cfg.task.adversarial_temperature > 0:
+                #     with torch.no_grad():
+                #         neg_weight[:, 1:] = F.softmax(pred[:, 1:] / cfg.task.adversarial_temperature, dim=-1)
+                # else:
+                #     neg_weight[:, 1:] = 1 / cfg.task.num_negative
+                # loss = (loss * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)
+                # loss = loss.mean()
+                
                 pred = parallel_model(train_data, batch)
-                target = torch.zeros_like(pred)
-                target[:, 0] = 1
-                loss = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
-                neg_weight = torch.ones_like(pred)
-                if cfg.task.adversarial_temperature > 0:
-                    with torch.no_grad():
-                        neg_weight[:, 1:] = F.softmax(pred[:, 1:] / cfg.task.adversarial_temperature, dim=-1)
-                else:
-                    neg_weight[:, 1:] = 1 / cfg.task.num_negative
-                loss = (loss * neg_weight).sum(dim=-1) / neg_weight.sum(dim=-1)
-                loss = loss.mean()
+                target = batch[:,:,1] #4712, 31181
+                target = (target == 31181).long().view(len(batch))
+                
+                loss = F.cross_entropy(pred, target)           # 标量
 
                 loss.backward()
                 optimizer.step()
@@ -82,7 +89,8 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
 
                 if util.get_rank() == 0 and batch_id % cfg.train.log_interval == 0:
                     logger.warning(separator)
-                    logger.warning("binary cross entropy: %g" % loss)
+                    logger.warning("cross entropy: %g" % loss.item())
+
                 losses.append(loss.item())
                 batch_id += 1
 
@@ -105,8 +113,8 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
 
         if rank == 0:
             logger.warning(separator)
-            logger.warning("Evaluate on valid")
-        result = test(cfg, model, valid_data, filtered_data=filtered_data, device=device, logger=logger)
+            logger.warning("Evaluate on valid (AUROC)")
+        result = test_auc(cfg, model, valid_data, device=device, logger=logger)
         if result > best_result:
             best_result = result
             best_epoch = epoch
@@ -116,6 +124,64 @@ def train_and_validate(cfg, model, train_data, valid_data, device, logger, filte
     state = torch.load("model_epoch_%d.pth" % best_epoch, map_location=device)
     model.load_state_dict(state["model"])
     util.synchronize()
+
+
+def test_auc(cfg, model, valid_data, device, logger):
+    model.eval()
+
+    world_size = util.get_world_size()
+    rank = util.get_rank()
+
+    # valid_triplets: 每行 [h, t, r]，和 train 那里一样的构造方式
+    valid_triplets = torch.cat(
+        [valid_data.target_edge_index, valid_data.target_edge_type.unsqueeze(0)]
+    ).t()  # shape: [num_valid_edges, 3]
+
+    sampler = torch_data.DistributedSampler(
+        valid_triplets,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+    )
+    valid_loader = torch_data.DataLoader(
+        valid_triplets,
+        batch_size=cfg.train.batch_size,
+        sampler=sampler,
+    )
+
+    # TorchMetrics 的 AUROC，task="binary"
+    # 如果你以后要多卡，可以加 sync_on_compute=True
+    auc_metric = AUROC(task="binary").to(device)
+
+    with torch.no_grad():
+        for batch in valid_loader:
+            # 如果你还保留 negative_sampling（但已经不用负样本做 ranking 了），这行可以按需保留或删掉
+            batch = tasks.negative_sampling(
+                valid_data,
+                batch,
+                cfg.task.num_negative,
+                strict=cfg.task.strict_negative,
+            )
+
+            # pred: [B, 2]，两个类别的 logits
+            target = batch[:,:,1] #4712, 31181
+            target = (target == 31181).long().view(len(batch))
+            
+            logits = model(valid_data, batch)        # 注意这里用的是 model，不是 parallel_model
+
+            # 取正类的概率作为 score（label=1 对应“有”那个类）
+            prob_pos = F.softmax(logits, dim=-1)[:, 1]  # [B]
+
+            # 标签：0 / 1        # [B]
+            auc_metric.update(prob_pos, target)
+
+    auc = auc_metric.compute().item()
+    auc_metric.reset()
+
+    if rank == 0:
+        logger.warning(f"Valid AUROC: {auc:.6f}")
+
+    return auc
 
 
 @torch.no_grad()
@@ -294,8 +360,10 @@ if __name__ == "__main__":
     if util.get_rank() == 0:
         logger.warning(separator)
         logger.warning("Evaluate on valid")
-    test(cfg, model, valid_data, filtered_data=val_filtered_data, device=device, logger=logger)
+    test_auc(cfg, model, valid_data, device=device, logger=logger)
+    # test(cfg, model, valid_data, filtered_data=val_filtered_data, device=device, logger=logger)
     if util.get_rank() == 0:
         logger.warning(separator)
         logger.warning("Evaluate on test")
-    test(cfg, model, test_data, filtered_data=test_filtered_data, device=device, logger=logger)
+    test_auc(cfg, model, test_data, device=device, logger=logger)
+    # test(cfg, model, test_data, filtered_data=test_filtered_data, device=device, logger=logger)
